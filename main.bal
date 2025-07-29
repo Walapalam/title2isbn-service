@@ -1,13 +1,12 @@
 import ballerina/http;
 import ballerina/log;
-// No need to import config in Ballerina 2201.x+
+import ballerina/url;
 
-// BookResult type must be at module level
-type BookResult record {
-    string isbn;
-    string author;
-    string source;
-};
+// Type for Open Library book
+type OLBook record {| string[]? isbn_13; |};
+// Types for Appwrite response
+type AppwriteDoc record {| record {| string canonicalIsbn; |} data; |};
+type AppwriteList record {| AppwriteDoc[] documents; |};
 
 // --- Appwrite Configuration ---
 configurable string APW_ENDPOINT = ?;
@@ -19,165 +18,114 @@ configurable string BOOKS_COLLECTION_ID = ?;
 // --- Service Definition ---
 service / on new http:Listener(9090) {
 
-
     // Handles GET requests to /isbn?title=<book_title>
     resource function get isbn(string title) returns http:Response|http:InternalServerError {
-        // 1. Prepare Appwrite HTTP client and headers
-        http:Client appwriteClient = check new (APW_ENDPOINT);
-        map<string> headers = {
+
+        // 1. Initialize HTTP client and prepare headers for Appwrite
+        http:Client|http:ClientError appwriteClientResult = new (APW_ENDPOINT);
+        if appwriteClientResult is http:ClientError {
+            log:printError("Failed to create Appwrite client: " + appwriteClientResult.toString());
+            return createNotFoundResponse("Failed to create Appwrite client");
+        }
+        http:Client appwriteClient = appwriteClientResult;
+        map<string> appwriteHeaders = {
             "X-Appwrite-Project": APW_PROJECT_ID,
             "X-Appwrite-Key": APW_API_KEY,
             "Content-Type": "application/json"
         };
 
-        // 2. Query Appwrite DB for an existing record
-        string listUrl = string `/databases/${APW_DATABASE_ID}/collections/${BOOKS_COLLECTION_ID}/documents?queries[]=equal("title","${title}")`;
-        string? isbnAppwrite = ();
-        string? authorAppwrite = ();
-        var listResp = appwriteClient->get(listUrl, headers = headers);
-        if listResp is http:Response {
-            json|error listPayload = listResp.getJsonPayload();
-            if listPayload is json {
-                json[] docs = [];
-                if "documents" in listPayload && listPayload["documents"] is json[] {
-                    docs = <json[]>listPayload["documents"];
-                }
-                if docs.length() > 0 {
-                    json bookData = docs[0];
-                    if "isbn" in bookData && bookData["isbn"] is string && "author" in bookData && bookData["author"] is string {
-                        isbnAppwrite = <string>bookData["isbn"];
-                        authorAppwrite = <string>bookData["author"];
-                        log:printInfo("Found ISBN in Appwrite DB", title = title, isbn = isbnAppwrite, author = authorAppwrite);
-                    }
-                }
+        // 2. Manually query Appwrite DB for an existing record
+        string|url:Error encodedTitleResult = url:encode(title, "UTF-8");
+        if encodedTitleResult is url:Error {
+            log:printError("Failed to encode title: " + encodedTitleResult.toString());
+            return createNotFoundResponse("Failed to encode title");
+        }
+        string encodedTitle = encodedTitleResult;
+        string listUrl = string `/databases/${APW_DATABASE_ID}/collections/${BOOKS_COLLECTION_ID}/documents?queries[]=equal("title",["${encodedTitle}"])`;
+
+        http:Response|error listResponse = appwriteClient->get(listUrl, headers = appwriteHeaders);
+        if listResponse is error {
+            log:printError("Error querying Appwrite: " + listResponse.toString());
+            return createNotFoundResponse("Error querying Appwrite");
+        }
+        json|http:ClientError payloadResult = listResponse.getJsonPayload();
+        if payloadResult is http:ClientError {
+            log:printError("Error getting JSON payload from Appwrite: " + payloadResult.toString());
+            return createNotFoundResponse("Error getting JSON payload from Appwrite");
+        }
+        json payload = payloadResult;
+        AppwriteList|error appwriteListResult = payload.cloneWithType(AppwriteList);
+        if appwriteListResult is error {
+            log:printError("Error converting Appwrite payload: " + appwriteListResult.toString());
+            return createNotFoundResponse("Error converting Appwrite payload");
+        }
+        AppwriteList appwriteList = appwriteListResult;
+        if appwriteList.documents.length() > 0 {
+            AppwriteDoc|error docResult = appwriteList.documents[0].cloneWithType(AppwriteDoc);
+            if docResult is error {
+                log:printError("Error converting Appwrite document: " + docResult.toString());
+                return createNotFoundResponse("Error converting Appwrite document");
             }
-        } else {
-            log:printError("Error querying Appwrite", err = listResp);
+            AppwriteDoc doc = docResult;
+            string canonicalIsbn = doc.data.canonicalIsbn;
+            log:printInfo("Found ISBN in Appwrite DB", title = title, isbn = canonicalIsbn);
+            return createOkResponse(canonicalIsbn);
         }
 
-        // 3. Query Open Library API
-        http:Client openLibraryClient = check new ("https://openlibrary.org");
-        string? isbnOpenLib = ();
-        string? authorOpenLib = ();
-        var olResp = openLibraryClient->get(string `/search.json?title=${title}`);
-        if olResp is http:Response {
-            json|error olPayload = olResp.getJsonPayload();
-            if olPayload is json {
-                json[] olDocs = [];
-                if "docs" in olPayload && olPayload["docs"] is json[] {
-                    olDocs = <json[]>olPayload["docs"];
-                }
-                if olDocs.length() > 0 {
-                    json olBook = olDocs[0];
-                    if "isbn" in olBook && olBook["isbn"] is json[] {
-                        json[] isbns = <json[]>olBook["isbn"];
-                        if isbns.length() > 0 {
-                            isbnOpenLib = isbns[0].toString();
-                        }
-                    }
-                    if "author_name" in olBook && olBook["author_name"] is json[] {
-                        json[] authors = <json[]>olBook["author_name"];
-                        if authors.length() > 0 {
-                            authorOpenLib = authors[0].toString();
-                        }
-                    }
-                }
-            }
-        }
+        // 3. If not in DB, fetch from Open Library API
+        log:printInfo("Book not found in DB, fetching from Open Library", title = title);
+        (string|error)? canonicalIsbnResult = findIsbnFromOpenLibrary(title);
+        if canonicalIsbnResult is () {
+            log:printWarn("No ISBN found in Open Library", title = title);
+        } else if canonicalIsbnResult is error {
+            log:printError("Error fetching from Open Library: " + canonicalIsbnResult.toString());
+            return createNotFoundResponse("Error fetching from Open Library");
+        } else if canonicalIsbnResult is string {
+            string canonicalIsbn = canonicalIsbnResult;
+            // 4. Manually create the document in Appwrite via POST request
+            string createUrl = string `/databases/${APW_DATABASE_ID}/collections/${BOOKS_COLLECTION_ID}/documents`;
+            map<json> dataPayload = {title: title, canonicalIsbn: canonicalIsbn};
+            json requestBody = {"documentId": "unique()", "data": dataPayload};
 
-        // 4. Query Google Books API
-        http:Client googleBooksClient = check new ("https://www.googleapis.com");
-        string? isbnGoogle = ();
-        string? authorGoogle = ();
-        string googleUrl = string `/books/v1/volumes?q=intitle:${title}`;
-        var gbResp = googleBooksClient->get(googleUrl);
-        if gbResp is http:Response {
-            json|error gbPayload = gbResp.getJsonPayload();
-            if gbPayload is json {
-                json[] gbItems = [];
-                if "items" in gbPayload && gbPayload["items"] is json[] {
-                    gbItems = <json[]>gbPayload["items"];
-                }
-                if gbItems.length() > 0 {
-                    json gbBook = gbItems[0];
-                    if "volumeInfo" in gbBook && gbBook["volumeInfo"] is json {
-                        json volumeInfo = <json>gbBook["volumeInfo"];
-                        if "industryIdentifiers" in volumeInfo && volumeInfo["industryIdentifiers"] is json[] {
-                            json[] ids = <json[]>volumeInfo["industryIdentifiers"];
-                            foreach var id in ids {
-                                if id is json && "type" in id && id["type"] is string && id["type"] == "ISBN_13" && "identifier" in id && id["identifier"] is string {
-                                    isbnGoogle = <string>id["identifier"];
-                                    break;
-                                }
-                            }
-                        }
-                        if "authors" in volumeInfo && volumeInfo["authors"] is json[] {
-                            json[] authors = <json[]>volumeInfo["authors"];
-                            if authors.length() > 0 {
-                                authorGoogle = authors[0].toString();
-                            }
-                        }
-                    }
-                }
+            http:Response|error createResponse = appwriteClient->post(createUrl, requestBody, headers = appwriteHeaders);
+            if createResponse is http:Response {
+                log:printInfo("Successfully stored new book in Appwrite", isbn = canonicalIsbn);
+            } else {
+                log:printError("Failed to store new book in Appwrite: " + createResponse.toString());
             }
-        }
 
-        // 5. Pick the most prominent ISBN by author match, or random if all are different
-        BookResult[] found = [];
-        if isbnAppwrite is string && authorAppwrite is string {
-            found.push({isbn: isbnAppwrite, author: authorAppwrite, source: "appwrite"});
+            // 5. Return the newly found ISBN
+            return createOkResponse(canonicalIsbn);
         }
-        if isbnOpenLib is string && authorOpenLib is string {
-            found.push({isbn: isbnOpenLib, author: authorOpenLib, source: "openlibrary"});
-        }
-        if isbnGoogle is string && authorGoogle is string {
-            found.push({isbn: isbnGoogle, author: authorGoogle, source: "google"});
-        }
-
-        if found.length() == 0 {
-            log:printWarn("Could not find an ISBN for title in any source", title = title);
-            return createNotFoundResponse("No ISBN found for the given title.");
-        }
-
-        // Try to find the most common author
-        map<int> authorCounts = {};
-        foreach var b in found {
-            authorCounts[b.author] = (authorCounts.hasKey(b.author) ? authorCounts[b.author] + 1 : 1);
-        }
-        int maxCount = 0;
-        string prominentAuthor = "";
-        foreach var [author, count] in authorCounts.entries() {
-            if count > maxCount {
-                maxCount = count;
-                prominentAuthor = author;
-            }
-        }
-        BookResult prominent = found[0];
-        if maxCount > 1 {
-            // Pick the ISBN with the most common author
-            foreach var b in found {
-                if b.author == prominentAuthor {
-                    prominent = b;
-                    break;
-                }
-            }
-        }
-        log:printInfo("Returning prominent ISBN", isbn = prominent.isbn, author = prominent.author, source = prominent.source);
-        return createOkResponseWithAuthor(prominent.isbn, prominent.author);
     }
 }
 
-// --- Helper Functions for HTTP Responses ---
-function createOkResponseWithAuthor(string isbn, string author) returns http:Response {
+// Function to call Open Library (unchanged)
+function findIsbnFromOpenLibrary(string title) returns string?|error {
+    http:Client openLibraryClient = check new ("https://openlibrary.org");
+    json response = check openLibraryClient->get(string `/search.json?title=${title}`);
+    record {| json[] docs; |} olResponse = check response.cloneWithType();
+    if olResponse.docs.length() == 0 { return (); }
+    OLBook firstBook = <OLBook>olResponse.docs[0];
+    if firstBook.isbn_13 is string[] {
+        string[] isbnArr = <string[]>firstBook.isbn_13;
+        if isbnArr.length() > 0 {
+            return isbnArr[0];
+        }
+    }
+    return ();
+}
+
+// HTTP Response Helper Functions (unchanged)
+function createOkResponse(string isbn) returns http:Response {
     http:Response res = new;
-    res.setPayload({isbn: isbn, author: author});
-    res.statusCode = 200; // OK
+    res.setPayload({isbn: isbn});
     return res;
 }
 
 function createNotFoundResponse(string message) returns http:Response {
     http:Response res = new;
-    res.setPayload({error: message});
-    res.statusCode = 404; // Not Found
+    res.setPayload({"error": message});
+    res.statusCode = 404;
     return res;
 }
