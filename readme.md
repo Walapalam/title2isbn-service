@@ -47,6 +47,7 @@ To run this service locally, follow these steps.
 ```sh
 git clone [https://github.com/Walapalam/title2isbn-service.git](https://github.com/Walapalam/title2isbn-service.git)
 cd title2isbn-service
+```
 
 ---
 
@@ -58,7 +59,7 @@ Create a file named `Config.toml` in the root of the project directory.
 
 Copy the content below into your new `Config.toml` file and fill in the placeholder values with your actual Appwrite credentials:
 
-```toml
+```
 APW_ENDPOINT = "<YOUR_APPWRITE_ENDPOINT_URL>"
 APW_PROJECT_ID = "<YOUR_APPWRITE_PROJECT_ID>"
 APW_API_KEY = "<YOUR_APPWRITE_API_KEY>"
